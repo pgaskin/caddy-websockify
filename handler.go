@@ -64,8 +64,8 @@ var (
 	_ caddyhttp.MiddlewareHandler = (*Module)(nil)
 )
 
-// Module proxies binary WebSocket connections to an upstream tcp or unix
-// socket, passing non-WebSocket requests to the next handler.
+// Module proxies binary WebSocket connections to an upstream TCP or unix socket
+// (optionally using TLS), passing non-WebSocket requests to the next handler.
 //
 // WebSocket requests using an HTTP/2 or HTTP/3 Extended CONNECT are supported
 // in addition to HTTP/1.1 upgrades (but clients currently won't use it in
@@ -456,7 +456,7 @@ func (m *Module) dial(ctx context.Context, repl *caddy.Replacer) (net.Conn, stri
 		}
 		conn, err := m.dialer.DialContext(ctx, na.Network, na.JoinHostPort(0))
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("upstream %q: %w", addr, err))
 			continue
 		}
 		if m.useTLS(na) {
