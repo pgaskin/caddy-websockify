@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"path"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -19,7 +20,14 @@ import (
 	"github.com/coder/websocket"
 	"github.com/dustin/go-humanize"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+// maxBufferSize is the largest allowed copy buffer size.
+const maxBufferSize = 64 << 20 // MiB
+
+// closeTimeout is how long [Module.Cleanup] waits for connections to close.
+const closeTimeout = time.Second
 
 func init() {
 	caddy.RegisterModule(Module{})
@@ -44,7 +52,7 @@ var (
 type Module struct {
 	// Upstream addresses in Caddy format, like "localhost:5900",
 	// "tcp6/[::1]:5900", or "unix//run/vnc.sock". Placeholders are expanded for
-	// each request. Multiple address are used round-robin across all
+	// each request. Multiple addresses are used round-robin across all
 	// connections, trying each one once sequentially until one connects or all
 	// fail.
 	Upstreams []string `json:"upstreams,omitempty"`
@@ -93,7 +101,8 @@ type Module struct {
 	dialer    net.Dialer
 	cfg       Config
 	anyOrigin bool
-	next      uint64
+	next      *atomic.Uint64 // upstream round-robin counter
+	active    *atomic.Int64  // number of open connections
 	ctx       context.Context
 	cancel    context.CancelFunc
 }
@@ -107,7 +116,18 @@ func (Module) CaddyModule() caddy.ModuleInfo {
 
 func (m *Module) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next()
-	m.Upstreams = append(m.Upstreams, d.RemainingArgs()...)
+	upstreams := func(args []string) error {
+		for _, u := range args {
+			if err := checkUpstream(u); err != nil {
+				return d.Err(err.Error())
+			}
+		}
+		m.Upstreams = append(m.Upstreams, args...)
+		return nil
+	}
+	if err := upstreams(d.RemainingArgs()); err != nil {
+		return err
+	}
 
 	for d.NextBlock(0) {
 		var err error
@@ -117,7 +137,7 @@ func (m *Module) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if len(args) == 0 {
 				return d.ArgErr()
 			}
-			m.Upstreams = append(m.Upstreams, args...)
+			err = upstreams(args)
 		case "dial_timeout":
 			m.DialTimeout, err = parseDuration(d, false)
 		case "keepalive":
@@ -132,14 +152,10 @@ func (m *Module) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
-			size, err := humanize.ParseBytes(d.Val())
+			m.BufferSize, err = parseBufferSize(d.Val())
 			if err != nil {
-				return d.Errf("bad buffer size %q: %v", d.Val(), err)
+				return d.Err(err.Error())
 			}
-			if size > 64<<20 {
-				return d.Errf("buffer size %q is too large", d.Val())
-			}
-			m.BufferSize = int(size)
 			if d.NextArg() {
 				return d.ArgErr()
 			}
@@ -163,6 +179,9 @@ func (m *Module) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		if err != nil {
 			return err
 		}
+	}
+	if len(m.Upstreams) == 0 {
+		return d.Err("no upstreams specified")
 	}
 	return nil
 }
@@ -202,6 +221,9 @@ func (m *Module) Provision(ctx caddy.Context) error {
 		m.Subprotocols = []string{"binary"}
 	}
 
+	m.next = new(atomic.Uint64)
+	m.active = new(atomic.Int64)
+
 	// not derived from the caddy context since connections may outlive it
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 	return nil
@@ -212,10 +234,7 @@ func (m *Module) Validate() error {
 		return errors.New("no upstreams")
 	}
 	for _, u := range m.Upstreams {
-		if strings.Contains(u, "{") {
-			continue
-		}
-		if _, err := parseUpstream(u); err != nil {
+		if err := checkUpstream(u); err != nil {
 			return err
 		}
 	}
@@ -231,6 +250,14 @@ func (m *Module) Validate() error {
 	if m.BufferSize < 0 {
 		return errors.New("buffer_size must not be negative")
 	}
+	if m.BufferSize > maxBufferSize {
+		return fmt.Errorf("buffer_size must not be larger than %s", humanize.IBytes(maxBufferSize))
+	}
+	for _, o := range m.Origins {
+		if _, err := path.Match(strings.ToLower(o), ""); err != nil {
+			return fmt.Errorf("origin pattern %q: %w", o, err)
+		}
+	}
 	if m.StreamCloseDelay < 0 {
 		return errors.New("stream_close_delay must not be negative")
 	}
@@ -240,8 +267,14 @@ func (m *Module) Validate() error {
 func (m *Module) Cleanup() error {
 	if m.StreamCloseDelay > 0 {
 		time.AfterFunc(time.Duration(m.StreamCloseDelay), m.cancel)
-	} else {
-		m.cancel()
+		return nil
+	}
+	m.cancel()
+
+	// give connections time to send their close frames, which are otherwise
+	// lost if the process is exiting
+	for start := time.Now(); m.active.Load() > 0 && time.Since(start) < closeTimeout; {
+		time.Sleep(10 * time.Millisecond)
 	}
 	return nil
 }
@@ -282,6 +315,9 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
 
+	m.active.Add(1)
+	defer m.active.Add(-1)
+
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:       m.Subprotocols,
 		OriginPatterns:     m.Origins,
@@ -296,7 +332,11 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 
 	start := time.Now()
 	stats, err := Proxy(m.ctx, ws, up, m.cfg)
-	m.logger.Debug("connection closed",
+	lvl := zapcore.DebugLevel
+	if err != nil {
+		lvl = zapcore.InfoLevel
+	}
+	m.logger.Log(lvl, "connection closed",
 		zap.String("upstream", addr),
 		zap.Duration("duration", time.Since(start)),
 		zap.Int64("bytes_up", stats.BytesUp),
@@ -310,7 +350,7 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 func (m *Module) dial(ctx context.Context, repl *caddy.Replacer) (net.Conn, string, error) {
 	var errs []error
 	n := uint64(len(m.Upstreams))
-	start := atomic.AddUint64(&m.next, 1) - 1
+	start := m.next.Add(1) - 1
 	for i := range n {
 		addr := repl.ReplaceAll(m.Upstreams[(start+i)%n], "")
 		na, err := parseUpstream(addr)
@@ -326,6 +366,15 @@ func (m *Module) dial(ctx context.Context, repl *caddy.Replacer) (net.Conn, stri
 		return conn, addr, nil
 	}
 	return nil, "", errors.Join(errs...)
+}
+
+// checkUpstream validates an upstream address, unless it contains placeholders.
+func checkUpstream(addr string) error {
+	if strings.Contains(addr, "{") {
+		return nil
+	}
+	_, err := parseUpstream(addr)
+	return err
 }
 
 // parseUpstream parses a caddy-style network address, only accepting known
@@ -359,15 +408,36 @@ func parseDuration(d *caddyfile.Dispenser, off bool) (caddy.Duration, error) {
 	if d.NextArg() {
 		return 0, d.ArgErr()
 	}
+	v, err := parseDurationValue(val, off)
+	if err != nil {
+		return 0, d.Err(err.Error())
+	}
+	return v, nil
+}
+
+// parseDurationValue parses a duration. If off is true, "off" becomes -1.
+func parseDurationValue(val string, off bool) (caddy.Duration, error) {
 	if off && val == "off" {
 		return -1, nil
 	}
 	v, err := caddy.ParseDuration(val)
 	if err != nil {
-		return 0, d.Errf("bad duration %q: %v", val, err)
+		return 0, fmt.Errorf("bad duration %q: %v", val, err)
 	}
 	if v < 0 {
-		return 0, d.Errf("duration %q must not be negative", val)
+		return 0, fmt.Errorf("duration %q must not be negative", val)
 	}
 	return caddy.Duration(v), nil
+}
+
+// parseBufferSize parses a copy buffer size.
+func parseBufferSize(val string) (int, error) {
+	size, err := humanize.ParseBytes(val)
+	if err != nil {
+		return 0, fmt.Errorf("bad buffer size %q: %v", val, err)
+	}
+	if size > maxBufferSize {
+		return 0, fmt.Errorf("buffer size %q is too large", val)
+	}
+	return int(size), nil
 }

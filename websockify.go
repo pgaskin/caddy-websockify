@@ -97,7 +97,7 @@ var (
 	ErrPingTimeout = errors.New("ping timeout")
 )
 
-// Config controls Run.
+// Config controls [Proxy].
 type Config struct {
 	// PingInterval is the frequency to ping the client at, or zero to disable.
 	PingInterval time.Duration
@@ -138,7 +138,7 @@ type Stats struct {
 // which caused the connection to end.
 func Proxy(ctx context.Context, ws *websocket.Conn, upstream net.Conn, cfg Config) (Stats, error) {
 	if cfg.BufferSize <= 0 {
-		cfg.BufferSize = 32 << 10 // kB
+		cfg.BufferSize = 32 << 10 // KiB
 	}
 	if cfg.PingTimeout <= 0 {
 		cfg.PingTimeout = cfg.PingInterval
@@ -147,18 +147,13 @@ func Proxy(ctx context.Context, ws *websocket.Conn, upstream net.Conn, cfg Confi
 	ioctx, iocancel := context.WithCancel(context.Background())
 	defer iocancel()
 
-	stopctx, stopcancel := context.WithCancel(context.Background())
-	defer stopcancel()
-
 	b := &conn{
-		cfg:     cfg,
-		ws:      ws,
-		nc:      websocket.NetConn(ioctx, ws, websocket.MessageBinary),
-		up:      upstream,
-		start:   time.Now(),
-		done:    make(chan struct{}),
-		stopctx: stopctx,
-		stopped: stopcancel,
+		cfg:   cfg,
+		ws:    ws,
+		nc:    websocket.NetConn(ioctx, ws, websocket.MessageBinary),
+		up:    upstream,
+		start: time.Now(),
+		done:  make(chan struct{}),
 	}
 	b.waiting.Store(-1)
 
@@ -210,10 +205,8 @@ type conn struct {
 	toUpstream atomic.Int64
 	toClient   atomic.Int64
 
-	once    sync.Once
-	done    chan struct{}
-	stopctx context.Context
-	stopped context.CancelFunc
+	once sync.Once
+	done chan struct{}
 
 	// set once done is closed
 	err    error
@@ -224,7 +217,6 @@ type conn struct {
 func (c *conn) stop(err error, code websocket.StatusCode, reason string) {
 	c.once.Do(func() {
 		c.err, c.code, c.reason = err, code, reason
-		c.stopped()
 		close(c.done)
 	})
 }
@@ -320,7 +312,10 @@ func (c *conn) ping() {
 		case <-t.C:
 		}
 		sent := time.Since(c.start)
-		ctx, cancel := context.WithTimeout(c.stopctx, c.cfg.PingTimeout)
+		// The context isn't cancelled when stopping since that would close the
+		// connection without a close frame if the ping is still being written.
+		// Closing the connection ends the ping.
+		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.PingTimeout)
 		err := c.ws.Ping(ctx)
 		cancel()
 		if err != nil {
