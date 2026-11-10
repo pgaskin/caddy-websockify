@@ -18,6 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -25,6 +28,7 @@ jobs:
       - run: go mod verify
       - run: go vet ./...
       - run: go build ./...
+      - run: GONOPROXY="$(go list -m)" go run golang.org/x/exp/cmd/gorelease@v0.0.0-20261014143641-f0251eb4aa3e -base="$(git describe --tags --abbrev=0 --match 'v*' HEAD^)"
     if: github.event_name != 'schedule'
 
   xcaddy:
