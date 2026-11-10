@@ -246,6 +246,18 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		return next.ServeHTTP(w, r)
 	}
 
+	// validate the handshake before dialing so invalid or cross-origin requests
+	// can't cause connections to the upstream (Accept checks it again the same
+	// way)
+	if status, err := checkHandshake(w, r); err != nil {
+		return caddyhttp.Error(status, err)
+	}
+	if !m.anyOrigin {
+		if err := checkOrigin(r, m.Origins); err != nil {
+			return caddyhttp.Error(http.StatusForbidden, err)
+		}
+	}
+
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	// dial first so we can still respond with an error

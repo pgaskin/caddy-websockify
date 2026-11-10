@@ -2,11 +2,15 @@ package websockify
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +24,56 @@ func IsWebSocket(r *http.Request) bool {
 	return r.Method == http.MethodGet &&
 		httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+// checkHandshake returns an error and the response status if r (which should
+// have already been checked with [IsWebSocket]), is not a valid handshake,
+// using the same rules as [websocket.Accept] (which doesn't currently let us
+// call verifyClientRequest separately). The origin is not checked.
+func checkHandshake(w http.ResponseWriter, r *http.Request) (int, error) {
+	if !r.ProtoAtLeast(1, 1) {
+		return http.StatusUpgradeRequired, fmt.Errorf("unsupported protocol %q", r.Proto)
+	}
+	if v := r.Header.Get("Sec-WebSocket-Version"); v != "13" {
+		w.Header().Set("Sec-WebSocket-Version", "13")
+		return http.StatusBadRequest, fmt.Errorf("unsupported websocket version %q", v)
+	}
+	keys := r.Header.Values("Sec-WebSocket-Key")
+	if len(keys) != 1 {
+		return http.StatusBadRequest, fmt.Errorf("expected one Sec-WebSocket-Key header, got %d", len(keys))
+	}
+	if key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(keys[0])); err != nil || len(key) != 16 {
+		return http.StatusBadRequest, fmt.Errorf("invalid Sec-WebSocket-Key %q", keys[0])
+	}
+	return 0, nil
+}
+
+// checkOrigin returns an error if the Origin header of r is not allowed, using
+// the same rules as [websocket.AcceptOptions.OriginPatterns] (since
+// [websocket.Accept] doesn't currently let us call verifyClientRequest
+// separately).
+func checkOrigin(r *http.Request, patterns []string) error {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return nil
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return fmt.Errorf("invalid origin %q: %w", origin, err)
+	}
+	if strings.EqualFold(r.Host, u.Host) {
+		return nil
+	}
+	for _, pattern := range patterns {
+		target := u.Host
+		if strings.Contains(pattern, "://") {
+			target = u.Scheme + "://" + u.Host
+		}
+		if ok, _ := path.Match(strings.ToLower(pattern), strings.ToLower(target)); ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("origin %q is not allowed for host %q", origin, r.Host)
 }
 
 var (
