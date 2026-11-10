@@ -58,7 +58,8 @@ type Module struct {
 	PingInterval caddy.Duration `json:"ping_interval,omitempty"`
 
 	// How long to wait for a pong from the downstream client before closing the
-	// connection. Defaults to the ping interval.
+	// connection. Defaults to the ping interval. Time spent receiving data from
+	// the client or waiting to write it to a slow upstream doesn't count.
 	PingTimeout caddy.Duration `json:"ping_timeout,omitempty"`
 
 	// Close the connection if no data is transferred in either direction for

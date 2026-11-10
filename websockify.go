@@ -87,7 +87,10 @@ type Config struct {
 	PingInterval time.Duration
 
 	// PingTimeout is how long to wait for a pong from the client. If zero,
-	// [Config.PingInterval] is used.
+	// [Config.PingInterval] is used. A ping only times out if nothing was
+	// received from the client and no data was waiting to be written to the
+	// upstream for the entire duration (since the pong may otherwise be queued
+	// behind unread data).
 	PingTimeout time.Duration
 
 	// IdleTimeout closes the connection if no data is transferred in either
@@ -141,6 +144,7 @@ func Proxy(ctx context.Context, ws *websocket.Conn, upstream net.Conn, cfg Confi
 		stopctx: stopctx,
 		stopped: stopcancel,
 	}
+	b.waiting.Store(-1)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -183,8 +187,9 @@ type conn struct {
 	nc  net.Conn
 	up  net.Conn
 
-	start  time.Time
-	active atomic.Int64 // since start
+	start   time.Time
+	active  atomic.Int64 // since start
+	waiting atomic.Int64 // when copyUp started waiting for the client since start, or -1
 
 	toUpstream atomic.Int64
 	toClient   atomic.Int64
@@ -235,7 +240,7 @@ func (c *conn) wait(ctx context.Context) {
 }
 
 func (c *conn) copyUp() {
-	rerr, werr := c.copy(c.up, c.nc, &c.toUpstream)
+	rerr, werr := c.copy(c.up, clientReader{c}, &c.toUpstream)
 	switch {
 	case werr != nil:
 		c.stop(fmt.Errorf("write to upstream server: %w", werr), websocket.StatusBadGateway, "upstream error")
@@ -279,6 +284,16 @@ func (c *conn) copy(dst io.Writer, src io.Reader, n *atomic.Int64) (rerr, werr e
 	}
 }
 
+// clientReader reads from the client, setting conn.waiting for the duration of
+// each read.
+type clientReader struct{ c *conn }
+
+func (r clientReader) Read(p []byte) (int, error) {
+	r.c.waiting.Store(int64(time.Since(r.c.start)))
+	defer r.c.waiting.Store(-1)
+	return r.c.nc.Read(p)
+}
+
 func (c *conn) ping() {
 	t := time.NewTicker(c.cfg.PingInterval)
 	defer t.Stop()
@@ -288,11 +303,19 @@ func (c *conn) ping() {
 			return
 		case <-t.C:
 		}
+		sent := time.Since(c.start)
 		ctx, cancel := context.WithTimeout(c.stopctx, c.cfg.PingTimeout)
 		err := c.ws.Ping(ctx)
 		cancel()
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
+				// Pongs are only read while copyUp is waiting for the client.
+				// If it wasn't for the entire timeout, data was received from
+				// the client, or the pong may be queued behind data blocked on
+				// the upstream.
+				if w := time.Duration(c.waiting.Load()); w < 0 || w > sent {
+					continue
+				}
 				err = ErrPingTimeout
 			} else {
 				err = fmt.Errorf("ping downstream client: %w", err)
