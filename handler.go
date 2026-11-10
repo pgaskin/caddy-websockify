@@ -37,6 +37,10 @@ var (
 
 // Module proxies binary WebSocket connections to an upstream tcp or unix
 // socket, passing non-WebSocket requests to the next handler.
+//
+// Only HTTP/1.1 WebSocket connections are supported. WebSocket requests using
+// an HTTP/2 or HTTP/3 Extended CONNECT are rejected (but these currently won't
+// be hit in practice).
 type Module struct {
 	// Upstream addresses in Caddy format, like "localhost:5900",
 	// "tcp6/[::1]:5900", or "unix//run/vnc.sock". Placeholders are expanded for
@@ -243,6 +247,17 @@ func (m *Module) Cleanup() error {
 }
 
 func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if isExtendedConnect(r) {
+		// [websocket.Accept] needs to hijack the connection, which isn't
+		// possible for HTTP/2 and HTTP/3. This is fine for now since clients
+		// only send an Extended CONNECT if the server advertises support for
+		// it, which Go's HTTP/2 server only does with GODEBUG=http2xconnect=1,
+		// so HTTP/2 clients use a separate HTTP/1.1 connection instead. quic-go
+		// always advertises it for HTTP/3, but only clients implementing RFC
+		// 9220 use it (and this is effectively nonexistent in practice, as
+		// WebTransport ended up replacing it).
+		return caddyhttp.Error(http.StatusNotImplemented, errors.New("websocket over HTTP/2 or HTTP/3 is not supported"))
+	}
 	if !IsWebSocket(r) {
 		return next.ServeHTTP(w, r)
 	}
