@@ -26,22 +26,6 @@ func IsWebSocket(r *http.Request) bool {
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
 }
 
-// isExtendedConnect returns true if r is a WebSocket request using an HTTP/2
-// (RFC 8441) or HTTP/3 (RFC 9220) Extended CONNECT instead of an upgrade.
-func isExtendedConnect(r *http.Request) bool {
-	if r.Method != http.MethodConnect {
-		return false
-	}
-	switch r.ProtoMajor {
-	case 2:
-		return r.Header.Get(":protocol") == "websocket"
-	case 3:
-		// quic-go sets Proto to the :protocol pseudo-header
-		return r.Proto == "websocket"
-	}
-	return false
-}
-
 // checkHandshake returns an error and the response status if r (which should
 // have already been checked with [IsWebSocket]), is not a valid handshake,
 // using the same rules as [websocket.Accept] (which doesn't currently let us

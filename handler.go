@@ -16,6 +16,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyevents"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/coder/websocket"
 	"github.com/dustin/go-humanize"
@@ -46,9 +47,9 @@ var (
 // Module proxies binary WebSocket connections to an upstream tcp or unix
 // socket, passing non-WebSocket requests to the next handler.
 //
-// Only HTTP/1.1 WebSocket connections are supported. WebSocket requests using
-// an HTTP/2 or HTTP/3 Extended CONNECT are rejected (but these currently won't
-// be hit in practice).
+// WebSocket requests using an HTTP/2 or HTTP/3 Extended CONNECT are supported
+// in addition to HTTP/1.1 upgrades (but clients currently won't use it in
+// practice).
 type Module struct {
 	// Upstream addresses in Caddy format, like "localhost:5900",
 	// "tcp6/[::1]:5900", or "unix//run/vnc.sock". Placeholders are expanded for
@@ -103,6 +104,8 @@ type Module struct {
 	anyOrigin bool
 	next      *atomic.Uint64 // upstream round-robin counter
 	active    *atomic.Int64  // number of open connections
+	streams   *atomic.Int64  // number of open connections using an Extended CONNECT
+	stopping  *atomic.Bool   // if the config has started being unloaded
 	ctx       context.Context
 	cancel    context.CancelFunc
 }
@@ -223,10 +226,27 @@ func (m *Module) Provision(ctx caddy.Context) error {
 
 	m.next = new(atomic.Uint64)
 	m.active = new(atomic.Int64)
+	m.streams = new(atomic.Int64)
+	m.stopping = new(atomic.Bool)
 
 	// not derived from the caddy context since connections may outlive it
 	m.ctx, m.cancel = context.WithCancel(context.Background())
-	return nil
+
+	// HACK: close connections when the config starts being unloaded instead of
+	// waiting for Cleanup if any are using an Extended CONNECT (a WebSocket
+	// connection using an Extended CONNECT is technically an in-progress
+	// request, so the server doesn't shut down until it ends, and if the
+	// process is exiting, Cleanup isn't called until it has)
+	events, err := ctx.App("events")
+	if err != nil {
+		return fmt.Errorf("getting events app: %v", err)
+	}
+	return events.(*caddyevents.App).On("stopping", eventHandlerFunc(func() {
+		m.stopping.Store(true)
+		if m.streams.Load() > 0 {
+			m.stop()
+		}
+	}))
 }
 
 func (m *Module) Validate() error {
@@ -264,12 +284,20 @@ func (m *Module) Validate() error {
 	return nil
 }
 
-func (m *Module) Cleanup() error {
+// stop closes all connections, after the stream close delay if set.
+func (m *Module) stop() {
 	if m.StreamCloseDelay > 0 {
 		time.AfterFunc(time.Duration(m.StreamCloseDelay), m.cancel)
+	} else {
+		m.cancel()
+	}
+}
+
+func (m *Module) Cleanup() error {
+	m.stop()
+	if m.StreamCloseDelay > 0 {
 		return nil
 	}
-	m.cancel()
 
 	// give connections time to send their close frames, which are otherwise
 	// lost if the process is exiting
@@ -280,18 +308,19 @@ func (m *Module) Cleanup() error {
 }
 
 func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if isExtendedConnect(r) {
+	stream := isExtendedConnect(r)
+	if stream {
 		// [websocket.Accept] needs to hijack the connection, which isn't
-		// possible for HTTP/2 and HTTP/3. This is fine for now since clients
-		// only send an Extended CONNECT if the server advertises support for
-		// it, which Go's HTTP/2 server only does with GODEBUG=http2xconnect=1,
-		// so HTTP/2 clients use a separate HTTP/1.1 connection instead. quic-go
-		// always advertises it for HTTP/3, but only clients implementing RFC
-		// 9220 use it (and this is effectively nonexistent in practice, as
-		// WebTransport ended up replacing it).
-		return caddyhttp.Error(http.StatusNotImplemented, errors.New("websocket over HTTP/2 or HTTP/3 is not supported"))
-	}
-	if !IsWebSocket(r) {
+		// possible for HTTP/2 and HTTP/3, so handle it like a HTTP/1.1 upgrade
+		// of the stream. This is rarely used since clients only send an
+		// Extended CONNECT if the server advertises support for it, which Go's
+		// HTTP/2 server only does with GODEBUG=http2xconnect=1, so HTTP/2
+		// clients use a separate HTTP/1.1 connection instead. quic-go always
+		// advertises it for HTTP/3, but only clients implementing RFC 9220 use
+		// it (and this is effectively nonexistent in practice, as WebTransport
+		// ended up replacing it).
+		w, r = extendedConnect(w, r)
+	} else if !IsWebSocket(r) {
 		return next.ServeHTTP(w, r)
 	}
 
@@ -317,6 +346,16 @@ func (m *Module) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 
 	m.active.Add(1)
 	defer m.active.Add(-1)
+
+	if stream {
+		m.streams.Add(1)
+		defer m.streams.Add(-1)
+
+		// the stopping event handler didn't see this one
+		if m.stopping.Load() {
+			m.stop()
+		}
+	}
 
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:       m.Subprotocols,
@@ -440,4 +479,11 @@ func parseBufferSize(val string) (int, error) {
 		return 0, fmt.Errorf("buffer size %q is too large", val)
 	}
 	return int(size), nil
+}
+
+type eventHandlerFunc func()
+
+func (fn eventHandlerFunc) Handle(context.Context, caddy.Event) error {
+	fn()
+	return nil
 }
