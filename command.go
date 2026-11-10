@@ -46,7 +46,7 @@ import (
 func init() {
 	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "websockify",
-		Usage: `[--from <addr>] [--to <addr>] [--origins <patterns>] [--basic-auth <username:password>] [--root <path>] [--browse] [--precompressed <encodings>] [--reverse-proxy <addr>] [--change-host-header] [--insecure] [--header-up "Field: value"] [--header-down "Field: value"] [--internal-certs] [--disable-redirects] [--access-log] [--debug]`,
+		Usage: `[--from <addr>] [--to <addr>] [--tls] [--origins <patterns>] [--basic-auth <username:password>] [--root <path>] [--browse] [--precompressed <encodings>] [--reverse-proxy <addr>] [--change-host-header] [--insecure] [--header-up "Field: value"] [--header-down "Field: value"] [--internal-certs] [--disable-redirects] [--access-log] [--debug]`,
 		Short: "A quick and production-ready WebSocket to TCP proxy",
 		Long: `
 A simple but production-ready WebSocket to TCP proxy.
@@ -68,6 +68,8 @@ If serving HTTPS:
     CA instead of attempting to issue a public certificate.
 
 For WebSocket connections:
+  --tls connects to the upstream with TLS, verifying its certificate for the
+    host in the --to address unless --insecure is specified.
   --origins allows cross-origin connections from hosts matching the patterns.
     Same-origin connections are always allowed. Use "*" to allow any origin.
   --subprotocols, --dial-timeout, --keepalive, --ping-interval,
@@ -97,7 +99,8 @@ For proxying other requests to another backend (like caddy reverse-proxy):
   --change-host-header sets the Host header on the request to the address
     of the reverse proxy upstream, instead of defaulting to the incoming Host
     header.
-  --insecure disables TLS verification with the reverse proxy upstream.
+  --insecure disables TLS verification with the reverse proxy upstream (this
+    also affects --to for the WebSocket upstream if --tls is set).
     WARNING: THIS DISABLES SECURITY BY NOT VERIFYING THE UPSTREAM'S
     CERTIFICATE.
 
@@ -112,29 +115,30 @@ Full documentation is available at:
 https://github.com/pgaskin/caddy-websockify
 `,
 		CobraFunc: func(cmd *cobra.Command) {
-			cmd.Flags().StringP("from", "f", "localhost", "Address on which to receive traffic")                                                                       // matches reverse-proxy
-			cmd.Flags().StringSliceP("to", "t", []string{}, "Upstream address(es) to which WebSocket connections should be proxied")                                   // websockify module (like reverse-proxy --to)
-			cmd.Flags().StringSliceP("origins", "", []string{}, "Allowed host patterns for cross-origin WebSocket connections")                                        // websockify module
-			cmd.Flags().StringSliceP("subprotocols", "", []string{}, "WebSocket subprotocols to negotiate (default binary)")                                           // websockify module
-			cmd.Flags().StringP("dial-timeout", "", "", "Timeout for connecting to each upstream")                                                                     // websockify module
-			cmd.Flags().StringP("keepalive", "", "", "TCP keepalive interval for the upstream connection, or \"off\"")                                                 // websockify module
-			cmd.Flags().StringP("ping-interval", "", "", "How often to send WebSocket pings to the client, or \"off\"")                                                // websockify module
-			cmd.Flags().StringP("ping-timeout", "", "", "How long to wait for a pong before closing the connection")                                                   // websockify module
-			cmd.Flags().StringP("idle-timeout", "", "", "Close connections with no data transferred for this long")                                                    // websockify module
-			cmd.Flags().StringP("buffer-size", "", "", "Copy buffer size for each direction")                                                                          // websockify module
-			cmd.Flags().StringArrayP("basic-auth", "", []string{}, "Require HTTP basic authentication (format: \"username:password\")")                                // websockify command
-			cmd.Flags().StringP("root", "", "", "Serve static files from this path")                                                                                   // matches file-server
-			cmd.Flags().BoolP("browse", "b", false, "Enable directory browsing")                                                                                       // matches file-server
-			cmd.Flags().StringSliceP("precompressed", "p", []string{}, "Specify precompression file extensions. Compression preference implied from flag order.")      // matches file-server
-			cmd.Flags().StringSliceP("reverse-proxy", "", []string{}, "HTTP upstream address(es) to which other requests should be proxied")                           // reverse-proxy --to
-			cmd.Flags().BoolP("change-host-header", "c", false, "Set reverse proxy upstream Host header to address of upstream")                                       // matches reverse-proxy
-			cmd.Flags().BoolP("insecure", "", false, "Disable TLS verification for the reverse proxy (WARNING: DISABLES SECURITY BY NOT VERIFYING TLS CERTIFICATES!)") // matches reverse-proxy
-			cmd.Flags().StringArrayP("header-up", "H", []string{}, "Set a request header to send to the reverse proxy upstream (format: \"Field: value\")")            // matches reverse-proxy
-			cmd.Flags().StringArrayP("header-down", "d", []string{}, "Set a response header to send back to the client (format: \"Field: value\")")                    // matches reverse-proxy
-			cmd.Flags().BoolP("disable-redirects", "r", false, "Disable HTTP->HTTPS redirects")                                                                        // matches reverse-proxy
-			cmd.Flags().BoolP("internal-certs", "i", false, "Use internal CA for issuing certs")                                                                       // matches reverse-proxy
-			cmd.Flags().BoolP("access-log", "", false, "Enable the access log")                                                                                        // matches reverse-proxy
-			cmd.Flags().BoolP("debug", "v", false, "Enable verbose debug logs")                                                                                        // matches reverse-proxy
+			cmd.Flags().StringP("from", "f", "localhost", "Address on which to receive traffic")                                                                   // matches reverse-proxy
+			cmd.Flags().StringSliceP("to", "t", []string{}, "Upstream address(es) to which WebSocket connections should be proxied")                               // websockify module (like reverse-proxy --to)
+			cmd.Flags().BoolP("tls", "", false, "Connect to the upstream with TLS")                                                                                // websockify module
+			cmd.Flags().StringSliceP("origins", "", []string{}, "Allowed host patterns for cross-origin WebSocket connections")                                    // websockify module
+			cmd.Flags().StringSliceP("subprotocols", "", []string{}, "WebSocket subprotocols to negotiate (default binary)")                                       // websockify module
+			cmd.Flags().StringP("dial-timeout", "", "", "Timeout for connecting to each upstream")                                                                 // websockify module
+			cmd.Flags().StringP("keepalive", "", "", "TCP keepalive interval for the upstream connection, or \"off\"")                                             // websockify module
+			cmd.Flags().StringP("ping-interval", "", "", "How often to send WebSocket pings to the client, or \"off\"")                                            // websockify module
+			cmd.Flags().StringP("ping-timeout", "", "", "How long to wait for a pong before closing the connection")                                               // websockify module
+			cmd.Flags().StringP("idle-timeout", "", "", "Close connections with no data transferred for this long")                                                // websockify module
+			cmd.Flags().StringP("buffer-size", "", "", "Copy buffer size for each direction")                                                                      // websockify module
+			cmd.Flags().StringArrayP("basic-auth", "", []string{}, "Require HTTP basic authentication (format: \"username:password\")")                            // websockify command
+			cmd.Flags().StringP("root", "", "", "Serve static files from this path")                                                                               // matches file-server
+			cmd.Flags().BoolP("browse", "b", false, "Enable directory browsing")                                                                                   // matches file-server
+			cmd.Flags().StringSliceP("precompressed", "p", []string{}, "Specify precompression file extensions. Compression preference implied from flag order.")  // matches file-server
+			cmd.Flags().StringSliceP("reverse-proxy", "", []string{}, "HTTP upstream address(es) to which other requests should be proxied")                       // reverse-proxy --to
+			cmd.Flags().BoolP("change-host-header", "c", false, "Set reverse proxy upstream Host header to address of upstream")                                   // matches reverse-proxy
+			cmd.Flags().BoolP("insecure", "", false, "Disable TLS verification for the upstreams (WARNING: DISABLES SECURITY BY NOT VERIFYING TLS CERTIFICATES!)") // matches reverse-proxy
+			cmd.Flags().StringArrayP("header-up", "H", []string{}, "Set a request header to send to the reverse proxy upstream (format: \"Field: value\")")        // matches reverse-proxy
+			cmd.Flags().StringArrayP("header-down", "d", []string{}, "Set a response header to send back to the client (format: \"Field: value\")")                // matches reverse-proxy
+			cmd.Flags().BoolP("disable-redirects", "r", false, "Disable HTTP->HTTPS redirects")                                                                    // matches reverse-proxy
+			cmd.Flags().BoolP("internal-certs", "i", false, "Use internal CA for issuing certs")                                                                   // matches reverse-proxy
+			cmd.Flags().BoolP("access-log", "", false, "Enable the access log")                                                                                    // matches reverse-proxy
+			cmd.Flags().BoolP("debug", "v", false, "Enable verbose debug logs")                                                                                    // matches reverse-proxy
 			cmd.RunE = caddycmd.WrapCommandFuncForCobra(cmdWebsockify)
 		},
 	})
@@ -162,6 +166,7 @@ func commandConfig(fs caddycmd.Flags) (*caddy.Config, string, error) {
 	from := fs.String("from")
 	changeHost := fs.Bool("change-host-header")
 	insecure := fs.Bool("insecure")
+	upstreamTLS := fs.Bool("tls")
 	disableRedir := fs.Bool("disable-redirects")
 	internalCerts := fs.Bool("internal-certs")
 	accessLog := fs.Bool("access-log")
@@ -231,6 +236,16 @@ func commandConfig(fs caddycmd.Flags) (*caddy.Config, string, error) {
 	if len(ws.Upstreams) == 0 {
 		return nil, "", errors.New("--to is required")
 	}
+	if upstreamTLS {
+		ws.TLS = &reverseproxy.TLSConfig{InsecureSkipVerify: insecure}
+		if !insecure {
+			for _, u := range ws.Upstreams {
+				if na, err := parseUpstream(u); err == nil && tlsServerName(na) == "" {
+					return nil, "", fmt.Errorf("--tls can't verify the certificate for upstream %q since the address doesn't have a host (use --insecure to skip verification)", u)
+				}
+			}
+		}
+	}
 	if ws.Origins, err = fs.GetStringSlice("origins"); err != nil {
 		return nil, "", fmt.Errorf("invalid origins flag: %v", err)
 	}
@@ -279,8 +294,11 @@ func commandConfig(fs caddycmd.Flags) (*caddy.Config, string, error) {
 	if proxy != nil {
 		handlers = append(handlers, proxy)
 	} else {
-		if changeHost || insecure || fs.Changed("header-up") {
-			return nil, "", errors.New("--change-host-header, --insecure, and --header-up require --reverse-proxy")
+		if changeHost || fs.Changed("header-up") {
+			return nil, "", errors.New("--change-host-header and --header-up require --reverse-proxy")
+		}
+		if insecure && !upstreamTLS {
+			return nil, "", errors.New("--insecure requires --tls or --reverse-proxy")
 		}
 		if static == nil {
 			handlers = append(handlers, caddyconfig.JSONModuleObject(caddyhttp.StaticError{

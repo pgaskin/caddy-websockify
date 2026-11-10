@@ -18,20 +18,26 @@ package websockify
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"github.com/coder/websocket"
 	"github.com/dustin/go-humanize"
 	"go.uber.org/zap"
@@ -90,8 +96,8 @@ type Module struct {
 	PingTimeout caddy.Duration `json:"ping_timeout,omitempty"`
 
 	// Close the connection if no data is transferred in either direction for
-	// this long, excluding pings. If not specified, the idle timeout is
-	// disabled.
+	// the specified duration, excluding pings. If not specified, the idle
+	// timeout is disabled.
 	IdleTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 
 	// Copy buffer size, for each direction, which is also the largest chunk
@@ -112,8 +118,16 @@ type Module struct {
 	// on reload). If not specified, they're closed immediately.
 	StreamCloseDelay caddy.Duration `json:"stream_close_delay,omitempty"`
 
+	// If set, TLS is used for the upstream connections. See
+	// [reverseproxy.TLSConfig].
+	//
+	//  - [reverseproxy.TLSConfig.ServerName] is set to the host of the upstream address by default, and must be configured explicitly for unix sockets and addresses without a host unless [reverseproxy.TLSConfig.InsecureSkipVerify] is set. Placeholders are supported.
+	//  - [reverseproxy.TLSConfig.HandshakeTimeout] is set to [Module.DialTimeout] if not specified.
+	TLS *reverseproxy.TLSConfig `json:"tls,omitempty"`
+
 	logger    *zap.Logger
 	dialer    net.Dialer
+	tlsConfig *tls.Config
 	cfg       Config
 	anyOrigin bool
 	next      *atomic.Uint64 // upstream round-robin counter
@@ -191,7 +205,7 @@ func (m *Module) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		case "stream_close_delay":
 			m.StreamCloseDelay, err = parseDuration(d, false)
 		default:
-			return d.Errf("unrecognized subdirective %q", d.Val())
+			err = m.unmarshalCaddyfileTLS(d)
 		}
 		if err != nil {
 			return err
@@ -246,6 +260,20 @@ func (m *Module) Provision(ctx caddy.Context) error {
 	// not derived from the caddy context since connections may outlive it
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
+	// the above must be set before anything can fail, since Cleanup is still
+	// called if Provision returns an error
+	if m.TLS != nil {
+		cfg, err := m.TLS.MakeTLSClientConfig(ctx)
+		if err != nil {
+			return fmt.Errorf("provision TLS client config: %v", err)
+		}
+		if cfg == nil {
+			// nothing other than the defaults was configured
+			cfg = new(tls.Config)
+		}
+		m.tlsConfig = cfg
+	}
+
 	// HACK: close connections when the config starts being unloaded instead of
 	// waiting for Cleanup if any are using an Extended CONNECT (a WebSocket
 	// connection using an Extended CONNECT is technically an in-progress
@@ -270,6 +298,21 @@ func (m *Module) Validate() error {
 	for _, u := range m.Upstreams {
 		if err := checkUpstream(u); err != nil {
 			return err
+		}
+	}
+	if m.TLS != nil {
+		if m.TLS.HandshakeTimeout < 0 {
+			return errors.New("tls_timeout must not be negative")
+		}
+		if m.TLS.ServerName == "" && !m.TLS.InsecureSkipVerify {
+			for _, u := range m.Upstreams {
+				if strings.Contains(u, "{") {
+					continue
+				}
+				if na, _ := parseUpstream(u); m.useTLS(na) && tlsServerName(na) == "" {
+					return fmt.Errorf("upstream %q: tls_server_name is required since the address doesn't have a host", u)
+				}
+			}
 		}
 	}
 	if m.DialTimeout < 0 {
@@ -416,9 +459,60 @@ func (m *Module) dial(ctx context.Context, repl *caddy.Replacer) (net.Conn, stri
 			errs = append(errs, err)
 			continue
 		}
+		if m.useTLS(na) {
+			if conn, err = m.handshake(ctx, repl, conn, na); err != nil {
+				errs = append(errs, fmt.Errorf("upstream %q: %w", addr, err))
+				continue
+			}
+		}
 		return conn, addr, nil
 	}
 	return nil, "", errors.Join(errs...)
+}
+
+// useTLS returns true if TLS is used for the upstream at na.
+func (m *Module) useTLS(na caddy.NetworkAddress) bool {
+	return m.TLS != nil && !slices.Contains(m.TLS.ExceptPorts, strconv.Itoa(int(na.StartPort)))
+}
+
+// tlsServerName returns the default TLS server name for the upstream at na,
+// which is empty if the address doesn't have a host.
+func tlsServerName(na caddy.NetworkAddress) string {
+	if na.IsUnixNetwork() {
+		return ""
+	}
+	return na.Host
+}
+
+// handshake starts TLS on a connection to the upstream at na, closing it on
+// failure.
+func (m *Module) handshake(ctx context.Context, repl *caddy.Replacer, conn net.Conn, na caddy.NetworkAddress) (net.Conn, error) {
+	cfg := m.tlsConfig
+	name := cfg.ServerName
+	if strings.Contains(name, "{") {
+		name = repl.ReplaceAll(name, "")
+	}
+	if name == "" {
+		name = tlsServerName(na)
+	}
+	if name != cfg.ServerName {
+		cfg = cfg.Clone()
+		cfg.ServerName = name
+	}
+
+	timeout := time.Duration(m.TLS.HandshakeTimeout)
+	if timeout == 0 {
+		timeout = time.Duration(m.DialTimeout)
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	tc := tls.Client(conn, cfg)
+	if err := tc.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("tls handshake: %w", err)
+	}
+	return tc, nil
 }
 
 // checkUpstream validates an upstream address, unless it contains placeholders.
@@ -499,5 +593,93 @@ type eventHandlerFunc func()
 
 func (fn eventHandlerFunc) Handle(context.Context, caddy.Event) error {
 	fn()
+	return nil
+}
+
+// unmarshalCaddyfileTLS matches the built-in reverse_proxy http transport.
+func (m *Module) unmarshalCaddyfileTLS(d *caddyfile.Dispenser) error {
+	if !strings.HasPrefix(d.Val(), "tls") {
+		return d.Errf("unrecognized subdirective %q", d.Val())
+	}
+	if m.TLS == nil {
+		m.TLS = new(reverseproxy.TLSConfig)
+	}
+	switch d.Val() {
+	case "tls":
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+	case "tls_client_auth":
+		args := d.RemainingArgs()
+		switch len(args) {
+		case 1:
+			m.TLS.ClientCertificateAutomate = args[0]
+		case 2:
+			m.TLS.ClientCertificateFile = args[0]
+			m.TLS.ClientCertificateKeyFile = args[1]
+		default:
+			return d.ArgErr()
+		}
+	case "tls_insecure_skip_verify":
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+		m.TLS.InsecureSkipVerify = true
+	case "tls_curves":
+		m.TLS.Curves = d.RemainingArgs()
+		if len(m.TLS.Curves) == 0 {
+			return d.ArgErr()
+		}
+	case "tls_timeout":
+		var err error
+		if m.TLS.HandshakeTimeout, err = parseDuration(d, false); err != nil {
+			return err
+		}
+	case "tls_server_name":
+		if !d.NextArg() {
+			return d.ArgErr()
+		}
+		m.TLS.ServerName = d.Val()
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+	case "tls_renegotiation":
+		if !d.NextArg() {
+			return d.ArgErr()
+		}
+		switch d.Val() {
+		case "never", "once", "freely":
+			m.TLS.Renegotiation = d.Val()
+		default:
+			return d.ArgErr()
+		}
+	case "tls_except_ports":
+		m.TLS.ExceptPorts = d.RemainingArgs()
+		if len(m.TLS.ExceptPorts) == 0 {
+			return d.ArgErr()
+		}
+	case "tls_trust_pool":
+		if !d.NextArg() {
+			return d.ArgErr()
+		}
+		modStem := d.Val()
+		modID := "tls.ca_pool.source." + modStem
+		unm, err := caddyfile.UnmarshalModule(d, modID)
+		if err != nil {
+			return err
+		}
+		ca, ok := unm.(caddytls.CA)
+		if !ok {
+			return d.Errf("module %s is not a caddytls.CA", modID)
+		}
+		if m.TLS.CARaw != nil {
+			return d.Err("cannot specify \"tls_trust_pool\" twice")
+		}
+		m.TLS.CARaw = caddyconfig.JSONModuleObject(ca, "provider", modStem, nil)
+	default:
+		// TODO: ensure we handle new fields if they get added to TLSConfig (and
+		// see if there's a way to somehow reuse the original parsing logic)
+		return d.Errf("unrecognized or unimplemented subdirective %q", d.Val())
+	}
 	return nil
 }
